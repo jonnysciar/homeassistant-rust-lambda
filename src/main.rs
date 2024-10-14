@@ -8,11 +8,19 @@ static TOKEN: &str = "LONG_LIVED_ACCESS_TOKEN";
 
 async fn function_handler(
     event: LambdaEvent<Value>,
-    client: &reqwest::blocking::Client,
-    base_url: &str,
+    client: &reqwest::Client
 ) -> Result<Value, Error> {
+    let base_url = match env::var(BASE_URL) {
+        Ok(s) => format!("{}/api/alexa/smart_home", s),
+        _ => return Ok(json!({
+            "event": {
+                "payload": {
+                    "error": "Failed to retrieve base url"
+                }
+            }
+        })),
+    };
     let request = event.payload;
-
     let token = request
         .get("directive")
         .and_then(|directive| {
@@ -54,8 +62,8 @@ async fn function_handler(
         .post(base_url)
         .header("Authorization", format!("Bearer {}", token.unwrap()))
         .header("Content-Type", "application/json")
-        .body(request.to_string())
-        .send()?;
+        .json(&request).send()
+        .await?;
 
     let status_code = response.status().as_u16();
     if status_code >= 400 {
@@ -63,7 +71,7 @@ async fn function_handler(
             "event": {
                 "payload": {
                     "type": if status_code == 401 || status_code == 403 {"INVALID_AUTHORIZATION_CREDENTIAL"} else {"INTERNAL_ERROR"},
-                    "message": response.text()?
+                    "message": response.text().await?
                 }
             }
         });
@@ -71,20 +79,52 @@ async fn function_handler(
         return Ok(error_response);
     }
 
-    return Ok(response.json::<Value>()?);
+    return Ok(response.json().await?);
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     tracing::init_default_subscriber();
-    let client = reqwest::blocking::Client::new();
-    let base_url = match env::var(BASE_URL) {
-        Ok(s) => format!("{}/api/alexa/smart_home", s),
-        _ => return Ok(()),
-    };
+    let client = reqwest::Client::new();
 
     return run(service_fn(|e| {
-        function_handler(e, &client, &base_url.as_str())
+        function_handler(e, &client)
     }))
     .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::function_handler;
+    use lambda_runtime::{Context, LambdaEvent};
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn response_is_good_for_simple_input() {
+        let id = "ID";
+
+        let mut context = Context::default();
+        context.request_id = id.to_string();
+
+        let payload = json!({
+            "directive": {
+                "header": {
+                    "namespace": "Alexa.Discovery",
+                    "name": "Discover",
+                    "payloadVersion": "3",
+                    "messageId": "1bd5d003-31b9-476f-ad03-71d471922820"
+                },
+                "payload": {
+                    "scope": {
+                        "type": "BearerToken"
+                    }
+                }
+            }
+        });
+
+        let client = reqwest::Client::new();
+        let event = LambdaEvent { payload, context };
+        let result = function_handler(event, &client).await.unwrap();
+        println!("{result}");
+    }
 }
